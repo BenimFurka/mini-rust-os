@@ -1,20 +1,33 @@
 #![no_std]
 #![no_main]
+#![feature(alloc_error_handler)]
 
+extern crate alloc;
+
+extern crate rlibc;
+
+mod allocator;
+mod drivers;
+mod port;
+mod spin;
+mod vga_buffer;
+mod handle_command;
+pub mod commands;
+
+pub use port::{inb, outb, inw, outw, inl, outl};
+
+use core::panic::PanicInfo;
 use handle_command::handle_command;
 use vga_buffer::{Color, WRITER};
 
-mod handle_command;
-pub mod commands;
-mod vga_buffer;
-mod spin;
-
-extern crate rlibc;
+pub use drivers::pic;
 extern crate volatile;
 
 extern "C" {
     fn read_keyboard_input() -> u8;
 }
+
+#[macro_export]
 macro_rules! print {
     (($($arg:tt)*)) => ({
         $crate::vga_buffer::print(format_args!($($arg)*), None, None);
@@ -30,9 +43,7 @@ macro_rules! print {
     });
 }
 
-
 const INPUT_BUFFER_SIZE: usize = 128;
-pub static mut USER_NAME: &str = "User";
 static mut INPUT_BUFFER: [u8; INPUT_BUFFER_SIZE] = [0; INPUT_BUFFER_SIZE];
 static mut INPUT_BUFFER_INDEX: usize = 0;
 
@@ -76,6 +87,8 @@ const SCANCODE_TABLE_SHIFT: [char; 128] = [
 static mut SHIFT_PRESSED: bool = false;
 static mut CAPS_LOCK_PRESSED: bool = false;
 
+// TODO: Эта клавиатура с самого начала в основном файле
+//       стоит попробовать перенести в drivers/ наверное
 pub fn handle_input(scancode: u8) {
     unsafe {
         match scancode {
@@ -91,7 +104,7 @@ pub fn handle_input(scancode: u8) {
             0x0E => {
                 if INPUT_BUFFER_INDEX > 0 {
                     INPUT_BUFFER_INDEX -= 1;
-                    WRITER.delete_char();
+                    WRITER.lock().delete_char();
                 }
             }
             0x1C => {
@@ -105,7 +118,7 @@ pub fn handle_input(scancode: u8) {
                     INPUT_BUFFER_INDEX = 0;
                 }
 
-                print!(("\n{} >> ", USER_NAME), fg: Color::LightGreen); 
+                print!(("\n>> "), fg: Color::LightGreen);
             }
             _ => {
                 if scancode < 128 {
@@ -127,15 +140,12 @@ pub fn handle_input(scancode: u8) {
 
                     if character != '?' && INPUT_BUFFER_INDEX < INPUT_BUFFER_SIZE {
                         INPUT_BUFFER_INDEX += 1;
-                        print!((
-                            "{}",
-                            if CAPS_LOCK_PRESSED {
-                                character.to_ascii_uppercase()
-                            } else {
-                                character
-                            }),
-                            fg: Color::LightGray
-                        );
+                        let char_to_print = if CAPS_LOCK_PRESSED {
+                            character.to_ascii_uppercase()
+                        } else {
+                            character
+                        };
+                        print!(("{}", char_to_print), fg: Color::LightGray);
                     }
 
                     if scancode == 0x2A || scancode == 0x36 {
@@ -151,22 +161,32 @@ pub fn handle_input(scancode: u8) {
 }
 
 
-#[panic_handler]
-fn panic(info: &core::panic::PanicInfo) -> ! {
-    print!(("\n\nPanic occurred: {}\nBye!", info.message()), fg: Color::LightRed);
-    loop {}
-}
-
-
 #[no_mangle]
-pub extern "C" fn rust_main() {
+pub extern "C" fn rust_main() -> ! {
     vga_buffer::clear_screen();
+    
+    print!(("\nWelcome to Mini Rust OS 1.0\n"), fg: Color::LightBlue);
+    
+    print!(("Initializing PIC... "), fg: Color::White);
+    match drivers::pic::init() {
+        Ok(_) => print!(("OK\n"), fg: Color::LightGreen),
+        Err(e) => {
+            print!(("FAILED: {}\n", e), fg: Color::Red);
+            print!(("Continuing with limited functionality\n"), fg: Color::Yellow);
+        }
+    }
+    
+    print!(("Testing PIC... "), fg: Color::White);
+    if drivers::pic::test() {
+        print!(("OK\n"), fg: Color::LightGreen);
+    } else {
+        print!(("FAILED\n"), fg: Color::Red);
+    }
+    
+    print!(("\nType 'help' for a list of commands\n"), fg: Color::LightGray);
+    print!(("\n>> "), fg: Color::LightGreen);
+    
     let mut last_scancode: u8 = 0;
-    print!(
-        ("\nWelcome to Mini Rust OS 1.0\nTo get a list of commands, type \"help\"\n"
-    )
-    );
-    unsafe { print!(("\n{} >> ", USER_NAME)); }
 
     loop {
         let scancode = unsafe { read_keyboard_input() };
@@ -179,4 +199,20 @@ pub extern "C" fn rust_main() {
             }
         }
     }
+}
+
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    use core::fmt::Write;
+    let _lock = vga_buffer::WRITER_LOCK.lock();
+    let mut writer = vga_buffer::WRITER.lock();
+    
+    writer.set_color(vga_buffer::Color::LightRed, vga_buffer::Color::Black);
+    let _ = write!(writer, "\n\nKernel panic: {}\n", info);
+    loop {}
+}
+
+#[alloc_error_handler]
+fn alloc_error_handler(layout: core::alloc::Layout) -> ! {
+    panic!("allocation error: {:?}", layout)
 }

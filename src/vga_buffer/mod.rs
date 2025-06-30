@@ -1,5 +1,13 @@
+#![allow(dead_code)]
+
 use core::fmt;
 use volatile::Volatile;
+use core::ptr::NonNull;
+use lazy_static::lazy_static;
+use crate::spin::SpinMutex;
+
+mod modes;
+pub use modes::{VideoMode, VideoState};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,9 +57,17 @@ impl Color {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
-struct ColorCode(u8);
+pub struct ColorCode(u8);
 
 impl ColorCode {
+    pub fn foreground(&self) -> Color {
+        Color::from_u8(self.0 & 0x0F)
+    }
+    
+    pub fn background(&self) -> Color {
+        Color::from_u8((self.0 >> 4) & 0x0F)
+    }
+
     const fn new(foreground: Color, background: Color) -> ColorCode {
         ColorCode((background as u8) << 4 | (foreground as u8))
     }
@@ -64,34 +80,55 @@ struct ScreenChar {
     color_code: ColorCode,
 }
 
-const BUFFER_HEIGHT: usize = 25;
-const BUFFER_WIDTH: usize = 80;
+const DEFAULT_HEIGHT: usize = 25;
+const DEFAULT_WIDTH: usize = 80;
 
-struct Buffer {
-    chars: [[Volatile<ScreenChar>; BUFFER_WIDTH]; BUFFER_HEIGHT],
+pub(crate) struct Buffer {
+    chars: [[Volatile<ScreenChar>; DEFAULT_WIDTH]; DEFAULT_HEIGHT],
 }
-
-use core::ptr::NonNull;
 
 pub struct Writer {
     column_position: usize,
     color_code: ColorCode,
-    buffer: NonNull<Buffer>,
+    video_state: VideoState,
 }
 
+unsafe impl Send for Writer {}
+unsafe impl Sync for Writer {}
+
 impl Writer {
+    pub fn new() -> Self {
+        let mut video_state = VideoState::default();
+        video_state.set_mode(VideoMode::Text80x25);
+        Self {
+            column_position: 0,
+            color_code: ColorCode::new(Color::LightGreen, Color::Black),
+            video_state,
+        }
+    }
+    
+    pub fn set_color(&mut self, fg: Color, bg: Color) {
+        self.color_code = ColorCode::new(fg, bg);
+    }
+    
+    pub fn set_video_mode(&mut self, mode: VideoMode) {
+        self.video_state.set_mode(mode);
+        self.column_position = 0;
+    }
+    
     pub fn write_byte(&mut self, byte: u8) {
         match byte {
             b'\n' => self.new_line(),
             byte => {
-                if self.column_position >= BUFFER_WIDTH {
+                if self.column_position >= self.video_state.width {
                     self.new_line();
                 }
-                let row = BUFFER_HEIGHT - 1;
+                let row = self.video_state.height - 1;
                 let col = self.column_position;
                 let color_code = self.color_code;
+                
                 unsafe {
-                    self.buffer.as_mut().chars[row][col].write(ScreenChar {
+                    self.video_state.buffer.as_mut().chars[row][col].write(ScreenChar {
                         ascii_character: byte,
                         color_code,
                     });
@@ -101,20 +138,16 @@ impl Writer {
         }
     }
 
-    fn buffer(&mut self) -> &mut Buffer {
-        unsafe { self.buffer.as_mut() }
-    }
-
     fn new_line(&mut self) {
-        for row in 1..BUFFER_HEIGHT {
-            for col in 0..BUFFER_WIDTH {
-                let character = unsafe { self.buffer.as_ref().chars[row][col].read() };
+        for row in 1..self.video_state.height {
+            for col in 0..self.video_state.width {
+                let character = unsafe { self.video_state.buffer.as_ref().chars[row][col].read() };
                 unsafe {
-                    self.buffer.as_mut().chars[row - 1][col].write(character);
+                    self.video_state.buffer.as_mut().chars[row - 1][col].write(character);
                 }
             }
         }
-        self.clear_row(BUFFER_HEIGHT - 1);
+        self.clear_row(self.video_state.height - 1);
         self.column_position = 0;
     }
 
@@ -123,41 +156,48 @@ impl Writer {
             ascii_character: b' ',
             color_code: self.color_code,
         };
-        for col in 0..BUFFER_WIDTH {
+        for col in 0..self.video_state.width {
             unsafe {
-                self.buffer.as_mut().chars[row][col].write(blank);
+                self.video_state.buffer.as_mut().chars[row][col].write(blank);
             }
         }
     }
-    pub fn set_color(&mut self, foreground: Color, background: Color) {
-        self.color_code = ColorCode::new(foreground, background);
-    }
+
     pub fn delete_char(&mut self) {
         if self.column_position > 0 {
-            self.column_position -= 1; 
-            let row = BUFFER_HEIGHT - 1;
+            self.column_position -= 1;
+            let row = self.video_state.height - 1;
             let col = self.column_position;
-    
+            
+            let blank = ScreenChar {
+                ascii_character: b' ',
+                color_code: self.color_code,
+            };
+            
             unsafe {
-                self.buffer.as_mut().chars[row][col].write(ScreenChar {
-                    ascii_character: b' ', 
-                    color_code: self.color_code,
-                });
+                self.video_state.buffer.as_mut().chars[row][col].write(blank);
             }
-        } else {
-            for row in 1..BUFFER_HEIGHT {
-                for col in 0..BUFFER_WIDTH {
-                    let character = unsafe { self.buffer.as_ref().chars[row][col].read() };
-                    unsafe {
-                        self.buffer.as_mut().chars[row - 1][col].write(character);
-                    }
-                }
-            }
-    
-            self.clear_row(BUFFER_HEIGHT - 1);
-    
-            self.column_position = BUFFER_WIDTH - 1;
+        } else if self.video_state.height > 1 {
+            self.clear_row(self.video_state.height - 1);
+            self.column_position = self.video_state.width - 1;
+            
+            self.delete_char();
         }
+    }
+    
+    pub fn set_foreground_color(&mut self, color: Color) {
+        self.color_code = ColorCode::new(color, self.color_code.background());
+    }
+    
+    pub fn set_background_color(&mut self, color: Color) {
+        self.color_code = ColorCode::new(self.color_code.foreground(), color);
+    }
+    
+    pub fn clear_screen(&mut self) {
+        for row in 0..self.video_state.height {
+            self.clear_row(row);
+        }
+        self.column_position = 0;
     }
 }
 
@@ -170,57 +210,40 @@ impl fmt::Write for Writer {
     }
 }
 
-use crate::spin::Spinlock;
-
-pub static WRITER_LOCK: Spinlock<> = Spinlock::new();
-
-pub static mut WRITER: Writer = Writer {
-    column_position: 0,
-    color_code: ColorCode::new(Color::LightGreen, Color::Black),
-    buffer: unsafe { NonNull::new_unchecked(0xb8000 as *mut _) },
-};
-
-
-macro_rules! print {
-    ($($arg:tt)*) => ({
-        $crate::vga_buffer::print(format_args!($($arg)*), None, None);
-    });
-    ($($arg:tt)*, fg: $fg:expr) => ({
-        $crate::vga_buffer::print(format_args!($($arg)*), Some($fg), None);
-    });
-    ($($arg:tt)*, bg: $bg:expr) => ({
-        $crate::vga_buffer::print(format_args!($($arg)*), None, Some($bg));
-    });
-    ($($arg:tt)*, fg: $fg:expr, bg: $bg:expr) => ({
-        $crate::vga_buffer::print(format_args!($($arg)*), Some($fg), Some($bg));
-    });
+lazy_static! {
+    pub static ref WRITER: SpinMutex<Writer> = SpinMutex::new(Writer::new());
 }
+
+pub static WRITER_LOCK: SpinMutex<()> = SpinMutex::new(());
+
 pub fn print(args: fmt::Arguments, fg: Option<Color>, bg: Option<Color>) {
     use core::fmt::Write;
-    WRITER_LOCK.lock(); 
+    let _lock = WRITER_LOCK.lock();
+    let mut writer = WRITER.lock();
 
-        
-    unsafe {
-        if let Some(fg_color) = fg {
-            if let Some(bg_color) = bg {
-                WRITER.set_color(fg_color, bg_color);
-            } else {
-                let current_bg = (WRITER.color_code.0 >> 4) as u8;
-                WRITER.set_color(fg_color, Color::from_u8(current_bg));
-            }
-        } else if let Some(bg_color) = bg {
-            let current_fg = (WRITER.color_code.0 & 0x0F) as u8;
-            WRITER.set_color(Color::from_u8(current_fg), bg_color);
-        }
-        WRITER.write_fmt(args).unwrap();
+    if let Some(fg_color) = fg {
+        let current_bg = (writer.color_code.0 >> 4) as u8;
+        writer.set_color(fg_color, Color::from_u8(current_bg));
     }
-    WRITER_LOCK.unlock();
-
+    if let Some(bg_color) = bg {
+        let current_fg = (writer.color_code.0 & 0x0F) as u8;
+        writer.set_color(Color::from_u8(current_fg), bg_color);
+    }
+    
+    let _ = writer.write_fmt(args);
+    writer.set_color(Color::LightGreen, Color::Black);
 }
 
 pub fn clear_screen() {
-    for _ in 0..BUFFER_HEIGHT {
-        print!("");
+    use core::fmt::Write;
+    let mut writer = WRITER.lock();
+    for _ in 0..writer.video_state.height {
+        let _ = writer.write_str("\n");
     }
 }
 
+pub fn set_video_mode(mode: VideoMode) {
+    let mut writer = WRITER.lock();
+    writer.set_video_mode(mode);
+    clear_screen();
+}

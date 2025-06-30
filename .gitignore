@@ -1,0 +1,7 @@
+Cargo.lock
+disk.img
+
+/target
+/build/kernel-x86_64.bin
+/build/os-x86_64.iso
+/build/arch/*

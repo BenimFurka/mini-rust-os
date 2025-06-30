@@ -1,7 +1,7 @@
 [package]
 name = "mini_rust_os"
 version = "0.1.0"
-editon = "2021"
+edition = "2021"
 
 [lib]
 crate-type = ["staticlib"]
@@ -9,11 +9,19 @@ crate-type = ["staticlib"]
 [dependencies]
 rlibc = "0.1.4"
 volatile = "0.1.0"
+spin = { version = "0.9.8", features = ["spin_mutex"] }
+lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
+x86_64 = { version = "0.14.12", default-features = false, features = ["instructions", "inline_asm"] }
+
+[features]
+test = []
 
 [profile.dev]
+opt-level = "z"
 panic = "abort"
-opt-level = 3
+lto = true
 
 [profile.release]
+opt-level = "z"
 panic = "abort"
-opt-level = 3
+lto = true
